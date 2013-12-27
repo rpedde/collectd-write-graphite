@@ -1,10 +1,6 @@
 /**
  * collectd - src/write_graphite.c
- * Copyright (C) 2012       Pierre-Yves Ritschard
- * Copyright (C) 2011       Scott Sanders
- * Copyright (C) 2009       Paul Sadauskas
- * Copyright (C) 2009       Doug MacEachern
- * Copyright (C) 2007-2012  Florian octo Forster
+ * Copyright (C) 2011  Scott Sanders
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -19,14 +15,10 @@
  * with this program; if not, write to the Free Software Foundation, Inc.,
  * 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
  *
- * Authors:
- *   Florian octo Forster <octo at collectd.org>
- *   Doug MacEachern <dougm at hyperic.com>
- *   Paul Sadauskas <psadauskas at gmail.com>
- *   Scott Sanders <scott at jssjr.com>
- *   Pierre-Yves Ritschard <pyr at spootnik.org>
+ * Author:
+ *   Scott Sanders <scott@jssjr.com>
  *
- * Based on the write_http plugin.
+ *   based on the excellent write_http plugin
  **/
 
  /* write_graphite plugin configuation example
@@ -34,7 +26,7 @@
   * <Plugin write_graphite>
   *   <Carbon>
   *     Host "localhost"
-  *     Port "2003"
+  *     Port 2003
   *     Prefix "collectd"
   *   </Carbon>
   * </Plugin>
@@ -52,23 +44,22 @@
 #include <pthread.h>
 
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+#include <netinet/in.h>
 #include <netdb.h>
 
-#ifndef WG_DEFAULT_NODE
-# define WG_DEFAULT_NODE "localhost"
+#ifndef WG_FORMAT_NAME
+#define WG_FORMAT_NAME(ret, ret_len, vl, cb, name) \
+        wg_format_name (ret, ret_len, (vl)->host, (vl)->plugin, \
+                         (vl)->plugin_instance, (vl)->type, \
+                         (vl)->type_instance, (cb)->prefix, (cb)->postfix, \
+                         name, (cb)->dotchar)
 #endif
 
-#ifndef WG_DEFAULT_SERVICE
-# define WG_DEFAULT_SERVICE "2003"
-#endif
-
-#ifndef WG_DEFAULT_ESCAPE
-# define WG_DEFAULT_ESCAPE '_'
-#endif
-
-/* Ethernet - (IPv6 + TCP) = 1500 - (40 + 32) = 1428 */
 #ifndef WG_SEND_BUF_SIZE
-# define WG_SEND_BUF_SIZE 1428
+#define WG_SEND_BUF_SIZE 4096
 #endif
 
 /*
@@ -77,21 +68,18 @@
 struct wg_callback
 {
     int      sock_fd;
+    struct hostent *server;
 
-    char    *node;
-    char    *service;
+    char    *host;
+    int      port;
     char    *prefix;
     char    *postfix;
-    char     escape_char;
-
-    _Bool    store_rates;
-    _Bool    separate_instances;
-    _Bool    always_append_ds;
+    char     dotchar;
 
     char     send_buf[WG_SEND_BUF_SIZE];
     size_t   send_buf_free;
     size_t   send_buf_fill;
-    time_t   send_buf_init_time;
+    cdtime_t send_buf_init_time;
 
     pthread_mutex_t send_lock;
 };
@@ -105,32 +93,36 @@ static void wg_reset_buffer (struct wg_callback *cb)
     memset (cb->send_buf, 0, sizeof (cb->send_buf));
     cb->send_buf_free = sizeof (cb->send_buf);
     cb->send_buf_fill = 0;
-    cb->send_buf_init_time = time (NULL);
+    cb->send_buf_init_time = cdtime ();
 }
 
 static int wg_send_buffer (struct wg_callback *cb)
 {
-    ssize_t status = 0;
+    int status = 0;
 
-    status = swrite (cb->sock_fd, cb->send_buf, strlen (cb->send_buf));
+    status = write (cb->sock_fd, cb->send_buf, strlen (cb->send_buf));
     if (status < 0)
     {
-        char errbuf[1024];
-        ERROR ("write_graphite plugin: send failed with status %zi (%s)",
-                status, sstrerror (errno, errbuf, sizeof (errbuf)));
+        ERROR ("write_graphite plugin: send failed with "
+                "status %i (%s)",
+                status,
+                strerror (errno));
 
+        pthread_mutex_trylock (&cb->send_lock);
 
+        DEBUG ("write_graphite plugin: closing socket and restting fd "
+                "so reinit will occur");
         close (cb->sock_fd);
         cb->sock_fd = -1;
 
+        pthread_mutex_unlock (&cb->send_lock);
+
         return (-1);
     }
-
     return (0);
 }
 
-/* NOTE: You must hold cb->send_lock when calling this function! */
-static int wg_flush_nolock (int timeout, struct wg_callback *cb)
+static int wg_flush_nolock (cdtime_t timeout, struct wg_callback *cb)
 {
     int status;
 
@@ -142,16 +134,16 @@ static int wg_flush_nolock (int timeout, struct wg_callback *cb)
     /* timeout == 0  => flush unconditionally */
     if (timeout > 0)
     {
-        time_t now;
+        cdtime_t now;
 
-        now = time (NULL);
+        now = cdtime ();
         if ((cb->send_buf_init_time + timeout) > now)
             return (0);
     }
 
     if (cb->send_buf_fill <= 0)
     {
-        cb->send_buf_init_time = time (NULL);
+        cb->send_buf_init_time = cdtime ();
         return (0);
     }
 
@@ -163,62 +155,42 @@ static int wg_flush_nolock (int timeout, struct wg_callback *cb)
 
 static int wg_callback_init (struct wg_callback *cb)
 {
-    struct addrinfo ai_hints;
-    struct addrinfo *ai_list;
-    struct addrinfo *ai_ptr;
     int status;
 
-    const char *node = cb->node ? cb->node : WG_DEFAULT_NODE;
-    const char *service = cb->service ? cb->service : WG_DEFAULT_SERVICE;
+    struct sockaddr_in serv_addr;
 
     if (cb->sock_fd > 0)
         return (0);
 
-    memset (&ai_hints, 0, sizeof (ai_hints));
-#ifdef AI_ADDRCONFIG
-    ai_hints.ai_flags |= AI_ADDRCONFIG;
-#endif
-    ai_hints.ai_family = AF_UNSPEC;
-    ai_hints.ai_socktype = SOCK_STREAM;
-
-    ai_list = NULL;
-
-    status = getaddrinfo (node, service, &ai_hints, &ai_list);
-    if (status != 0)
-    {
-        ERROR ("write_graphite plugin: getaddrinfo (%s, %s) failed: %s",
-                node, service, gai_strerror (status));
-        return (-1);
-    }
-
-    assert (ai_list != NULL);
-    for (ai_ptr = ai_list; ai_ptr != NULL; ai_ptr = ai_ptr->ai_next)
-    {
-        cb->sock_fd = socket (ai_ptr->ai_family, ai_ptr->ai_socktype,
-                ai_ptr->ai_protocol);
-        if (cb->sock_fd < 0)
-            continue;
-
-        status = connect (cb->sock_fd, ai_ptr->ai_addr, ai_ptr->ai_addrlen);
-        if (status != 0)
-        {
-            close (cb->sock_fd);
-            cb->sock_fd = -1;
-            continue;
-        }
-
-        break;
-    }
-
-    freeaddrinfo (ai_list);
-
+    cb->sock_fd = socket (AF_INET, SOCK_STREAM, 0);
     if (cb->sock_fd < 0)
     {
+        ERROR ("write_graphite plugin: socket failed: %s", strerror (errno));
+        return (-1);
+    }
+    cb->server = gethostbyname(cb->host);
+    if (cb->server == NULL)
+    {
+        ERROR ("write_graphite plugin: no such host");
+        return (-1);
+    }
+    memset (&serv_addr, 0, sizeof (serv_addr));
+    serv_addr.sin_family = AF_INET;
+    memcpy (&serv_addr.sin_addr.s_addr,
+             cb->server->h_addr,
+             cb->server->h_length);
+    serv_addr.sin_port = htons(cb->port);
+
+    status = connect(cb->sock_fd,
+                      (struct sockaddr *) &serv_addr,
+                      sizeof(serv_addr));
+    if (status < 0)
+    {
         char errbuf[1024];
-        ERROR ("write_graphite plugin: Connecting to %s:%s failed. "
-                "The last error was: %s", node, service,
-                sstrerror (errno, errbuf, sizeof (errbuf)));
+        sstrerror (errno, errbuf, sizeof (errbuf));
+        ERROR ("write_graphite plugin: connect failed: %s", errbuf);
         close (cb->sock_fd);
+        cb->sock_fd = -1;
         return (-1);
     }
 
@@ -236,24 +208,17 @@ static void wg_callback_free (void *data)
 
     cb = data;
 
-    pthread_mutex_lock (&cb->send_lock);
-
     wg_flush_nolock (/* timeout = */ 0, cb);
 
     close(cb->sock_fd);
-    cb->sock_fd = -1;
-
-    sfree(cb->node);
-    sfree(cb->service);
+    sfree(cb->host);
     sfree(cb->prefix);
     sfree(cb->postfix);
-
-    pthread_mutex_destroy (&cb->send_lock);
 
     sfree(cb);
 }
 
-static int wg_flush (int timeout,
+static int wg_flush (cdtime_t timeout,
         const char *identifier __attribute__((unused)),
         user_data_t *user_data)
 {
@@ -347,112 +312,142 @@ static int wg_format_values (char *ret, size_t ret_len,
     return (0);
 }
 
-static void wg_copy_escape_part (char *dst, const char *src, size_t dst_len,
-    char escape_char)
+static int swap_chars (char *dst, const char *src,
+        const char from, const char to)
 {
     size_t i;
 
-    memset (dst, 0, dst_len);
+    int reps = 0;
 
-    if (src == NULL)
-        return;
-
-    for (i = 0; i < dst_len; i++)
+    for (i = 0; i < strlen(src) ; i++)
     {
-        if (src[i] == 0)
+        if (src[i] == from)
         {
-            dst[i] = 0;
-            break;
+            dst[i] = to;
+            ++reps;
         }
-
-        if ((src[i] == '.')
-                || isspace ((int) src[i])
-                || iscntrl ((int) src[i]))
-            dst[i] = escape_char;
         else
             dst[i] = src[i];
     }
+    dst[i] = '\0';
+
+    return reps;
 }
 
 static int wg_format_name (char *ret, int ret_len,
-        const value_list_t *vl,
-        const struct wg_callback *cb,
-        const char *ds_name)
+        const char *hostname,
+        const char *plugin, const char *plugin_instance,
+        const char *type, const char *type_instance,
+        const char *prefix, const char *postfix,
+        const char *ds_name, const char dotchar)
 {
-    char n_host[DATA_MAX_NAME_LEN];
-    char n_plugin[DATA_MAX_NAME_LEN];
-    char n_plugin_instance[DATA_MAX_NAME_LEN];
-    char n_type[DATA_MAX_NAME_LEN];
-    char n_type_instance[DATA_MAX_NAME_LEN];
+    int  status;
+    char *n_hostname = 0;
+    char *n_type_instance = 0;
 
-    char *prefix;
-    char *postfix;
+    assert (plugin != NULL);
+    assert (type != NULL);
 
-    char tmp_plugin[2 * DATA_MAX_NAME_LEN + 1];
-    char tmp_type[2 * DATA_MAX_NAME_LEN + 1];
+    if ((n_hostname = malloc(strlen(hostname)+1)) == NULL)
+    {
+        ERROR ("Unable to allocate memory for normalized hostname buffer");
+        return (-1);
+    }
 
-    prefix = cb->prefix;
-    if (prefix == NULL)
-        prefix = "";
+    if (swap_chars(n_hostname, hostname, '.', dotchar) == -1)
+    {
+        ERROR ("Unable to normalize hostname");
+        return (-1);
+    }
 
-    postfix = cb->postfix;
-    if (postfix == NULL)
-        postfix = "";
+    if (type_instance && type_instance[0] != '\0') {
+        if ((n_type_instance = malloc(strlen(type_instance)+1)) == NULL)
+        {
+            ERROR ("Unable to allocate memory for normalized datasource name buffer");
+            return (-1);
+        }
+        if (swap_chars(n_type_instance, type_instance, '.', dotchar) == -1)
+        {
+            ERROR ("Unable to normalize datasource name");
+            return (-1);
+        }
+    }
 
-    wg_copy_escape_part (n_host, vl->host,
-            sizeof (n_host), cb->escape_char);
-    wg_copy_escape_part (n_plugin, vl->plugin,
-            sizeof (n_plugin), cb->escape_char);
-    wg_copy_escape_part (n_plugin_instance, vl->plugin_instance,
-            sizeof (n_plugin_instance), cb->escape_char);
-    wg_copy_escape_part (n_type, vl->type,
-            sizeof (n_type), cb->escape_char);
-    wg_copy_escape_part (n_type_instance, vl->type_instance,
-            sizeof (n_type_instance), cb->escape_char);
-
-    if (n_plugin_instance[0] != '\0')
-        ssnprintf (tmp_plugin, sizeof (tmp_plugin), "%s%c%s",
-            n_plugin,
-            cb->separate_instances ? '.' : '-',
-            n_plugin_instance);
+    if ((plugin_instance == NULL) || (plugin_instance[0] == '\0'))
+    {
+        if ((n_type_instance == NULL) || (n_type_instance[0] == '\0'))
+        {
+            if ((ds_name == NULL) || (ds_name[0] == '\0'))
+                status = ssnprintf (ret, ret_len, "%s%s%s.%s.%s",
+                        prefix, n_hostname, postfix, plugin, type);
+            else
+                status = ssnprintf (ret, ret_len, "%s%s%s.%s.%s.%s",
+                        prefix, n_hostname, postfix, plugin, type, ds_name);
+        }
+        else
+        {
+            if ((ds_name == NULL) || (ds_name[0] == '\0'))
+                status = ssnprintf (ret, ret_len, "%s%s%s.%s.%s-%s",
+                        prefix, n_hostname, postfix, plugin, type,
+                        n_type_instance);
+            else
+                status = ssnprintf (ret, ret_len, "%s%s%s.%s.%s-%s.%s",
+                        prefix, n_hostname, postfix, plugin, type,
+                        n_type_instance, ds_name);
+        }
+    }
     else
-        sstrncpy (tmp_plugin, n_plugin, sizeof (tmp_plugin));
+    {
+        if ((n_type_instance == NULL) || (n_type_instance[0] == '\0'))
+        {
+            if ((ds_name == NULL) || (ds_name[0] == '\0'))
+                status = ssnprintf (ret, ret_len, "%s%s%s.%s.%s.%s",
+                        prefix, n_hostname, postfix, plugin,
+                        plugin_instance, type);
+            else
+                status = ssnprintf (ret, ret_len, "%s%s%s.%s.%s.%s.%s",
+                        prefix, n_hostname, postfix, plugin,
+                        plugin_instance, type, ds_name);
+        }
+        else
+        {
+            if ((ds_name == NULL) || (ds_name[0] == '\0'))
+                status = ssnprintf (ret, ret_len, "%s%s%s.%s.%s.%s-%s",
+                        prefix, n_hostname, postfix, plugin,
+                        plugin_instance, type, n_type_instance);
+            else
+                status = ssnprintf (ret, ret_len, "%s%s%s.%s.%s.%s-%s.%s",
+                        prefix, n_hostname, postfix, plugin,
+                        plugin_instance, type, n_type_instance, ds_name);
+        }
+    }
 
-    if (n_type_instance[0] != '\0')
-        ssnprintf (tmp_type, sizeof (tmp_type), "%s%c%s",
-            n_type,
-            cb->separate_instances ? '.' : '-',
-            n_type_instance);
-    else
-        sstrncpy (tmp_type, n_type, sizeof (tmp_type));
+    sfree(n_hostname);
+    sfree(n_type_instance);
 
-    if (ds_name != NULL)
-        ssnprintf (ret, ret_len, "%s%s%s.%s.%s.%s",
-            prefix, n_host, postfix, tmp_plugin, tmp_type, ds_name);
-    else
-        ssnprintf (ret, ret_len, "%s%s%s.%s.%s",
-            prefix, n_host, postfix, tmp_plugin, tmp_type);
-
+    if ((status < 1) || (status >= ret_len))
+        return (-1);
     return (0);
 }
 
 static int wg_send_message (const char* key, const char* value,
-        time_t now, struct wg_callback *cb)
+        cdtime_t time, struct wg_callback *cb)
 {
     int status;
     size_t message_len;
     char message[1024];
 
     message_len = (size_t) ssnprintf (message, sizeof (message),
-            "%s %s %u\r\n",
+            "%s %s %.0f\n",
             key,
             value,
-            now);
+            CDTIME_T_TO_DOUBLE(time));
     if (message_len >= sizeof (message)) {
         ERROR ("write_graphite plugin: message buffer too small: "
                 "Need %zu bytes.", message_len + 1);
         return (-1);
     }
+
 
     pthread_mutex_lock (&cb->send_lock);
 
@@ -476,8 +471,6 @@ static int wg_send_message (const char* key, const char* value,
             return (status);
         }
     }
-
-    /* Assert that we have enough space for this message. */
     assert (message_len < cb->send_buf_free);
 
     /* `message_len + 1' because `message_len' does not include the
@@ -487,13 +480,14 @@ static int wg_send_message (const char* key, const char* value,
     cb->send_buf_fill += message_len;
     cb->send_buf_free -= message_len;
 
-    DEBUG ("write_graphite plugin: [%s]:%s buf %zu/%zu (%.1f %%) \"%s\"",
-            cb->node,
-            cb->service,
+    DEBUG ("write_graphite plugin: <%s:%d> buf %zu/%zu (%g%%) \"%s\"",
+            cb->host,
+            cb->port,
             cb->send_buf_fill, sizeof (cb->send_buf),
             100.0 * ((double) cb->send_buf_fill) / ((double) sizeof (cb->send_buf)),
             message);
 
+    /* Check if we have enough space for this message. */
     pthread_mutex_unlock (&cb->send_lock);
 
     return (0);
@@ -514,15 +508,43 @@ static int wg_write_messages (const data_set_t *ds, const value_list_t *vl,
         return -1;
     }
 
-    for (i = 0; i < ds->ds_num; i++)
+    if (ds->ds_num > 1)
     {
-        const char *ds_name = NULL;
+        for (i = 0; i < ds->ds_num; i++)
+        {
+            /* Copy the identifier to `key' and escape it. */
+            status = WG_FORMAT_NAME (key, sizeof (key), vl, cb, ds->ds[i].name);
+            if (status != 0)
+            {
+                ERROR ("write_graphite plugin: error with format_name");
+                return (status);
+            }
 
-        if (cb->always_append_ds || (ds->ds_num > 1))
-            ds_name = ds->ds[i].name;
+            escape_string (key, sizeof (key));
+            /* Convert the values to an ASCII representation and put that
+             * into `values'. */
+            status = wg_format_values (values, sizeof (values), i, ds, vl, 0);
+            if (status != 0)
+            {
+                ERROR ("write_graphite plugin: error with "
+                        "wg_format_values");
+                return (status);
+            }
 
+            /* Send the message to graphite */
+            status = wg_send_message (key, values, vl->time, cb);
+            if (status != 0)
+            {
+                ERROR ("write_graphite plugin: error with "
+                        "wg_send_message");
+                return (status);
+            }
+        }
+    }
+    else
+    {
         /* Copy the identifier to `key' and escape it. */
-        status = wg_format_name (key, sizeof (key), vl, cb, ds_name);
+        status = WG_FORMAT_NAME (key, sizeof (key), vl, cb, NULL);
         if (status != 0)
         {
             ERROR ("write_graphite plugin: error with format_name");
@@ -532,8 +554,7 @@ static int wg_write_messages (const data_set_t *ds, const value_list_t *vl,
         escape_string (key, sizeof (key));
         /* Convert the values to an ASCII representation and put that into
          * `values'. */
-        status = wg_format_values (values, sizeof (values), i, ds, vl,
-                    cb->store_rates);
+        status = wg_format_values (values, sizeof (values), 0, ds, vl, 0);
         if (status != 0)
         {
             ERROR ("write_graphite plugin: error with "
@@ -561,7 +582,7 @@ static int wg_write (const data_set_t *ds, const value_list_t *vl,
     int status;
 
     if (user_data == NULL)
-        return (EINVAL);
+        return (-EINVAL);
 
     cb = user_data->data;
 
@@ -570,33 +591,59 @@ static int wg_write (const data_set_t *ds, const value_list_t *vl,
     return (status);
 }
 
-static int config_set_char (char *dest,
+static int config_set_number (int *dest,
         oconfig_item_t *ci)
 {
-    char buffer[4];
-    int status;
-
-    memset (buffer, 0, sizeof (buffer));
-
-    status = cf_util_get_string_buffer (ci, buffer, sizeof (buffer));
-    if (status != 0)
-        return (status);
-
-    if (buffer[0] == 0)
+    if ((ci->values_num != 1) || (ci->values[0].type != OCONFIG_TYPE_NUMBER))
     {
-        ERROR ("write_graphite plugin: Cannot use an empty string for the "
-                "\"EscapeCharacter\" option.");
+        WARNING ("write_graphite plugin: The `%s' config option "
+                "needs exactly one numeric argument.", ci->key);
         return (-1);
     }
 
-    if (buffer[1] != 0)
+    *dest = ci->values[0].value.number;
+
+    return (0);
+}
+
+static int config_set_char (char *dest,
+        oconfig_item_t *ci)
+{
+    if ((ci->values_num != 1) || (ci->values[0].type != OCONFIG_TYPE_STRING))
     {
-        WARNING ("write_graphite plugin: Only the first character of the "
-                "\"EscapeCharacter\" option ('%c') will be used.",
-                (int) buffer[0]);
+        WARNING ("write_graphite plugin: The `%s' config option "
+                "needs exactly one string argument.", ci->key);
+        return (-1);
     }
 
-    *dest = buffer[0];
+    *dest = ci->values[0].value.string[0];
+
+    return (0);
+}
+
+static int config_set_string (char **ret_string,
+        oconfig_item_t *ci)
+{
+    char *string;
+
+    if ((ci->values_num != 1)
+            || (ci->values[0].type != OCONFIG_TYPE_STRING))
+    {
+        WARNING ("write_graphite plugin: The `%s' config option "
+                "needs exactly one string argument.", ci->key);
+        return (-1);
+    }
+
+    string = strdup (ci->values[0].value.string);
+    if (string == NULL)
+    {
+        ERROR ("write_graphite plugin: strdup failed.");
+        return (-1);
+    }
+
+    if (*ret_string != NULL)
+        sfree (*ret_string);
+    *ret_string = string;
 
     return (0);
 }
@@ -605,7 +652,6 @@ static int wg_config_carbon (oconfig_item_t *ci)
 {
     struct wg_callback *cb;
     user_data_t user_data;
-    char callback_name[DATA_MAX_NAME_LEN];
     int i;
 
     cb = malloc (sizeof (*cb));
@@ -616,12 +662,12 @@ static int wg_config_carbon (oconfig_item_t *ci)
     }
     memset (cb, 0, sizeof (*cb));
     cb->sock_fd = -1;
-    cb->node = NULL;
-    cb->service = NULL;
+    cb->host = NULL;
+    cb->port = 2003;
     cb->prefix = NULL;
     cb->postfix = NULL;
-    cb->escape_char = WG_DEFAULT_ESCAPE;
-    cb->store_rates = 1;
+    cb->server = NULL;
+    cb->dotchar = '_';
 
     pthread_mutex_init (&cb->send_lock, /* attr = */ NULL);
 
@@ -630,21 +676,15 @@ static int wg_config_carbon (oconfig_item_t *ci)
         oconfig_item_t *child = ci->children + i;
 
         if (strcasecmp ("Host", child->key) == 0)
-            cf_util_get_string (child, &cb->node);
+            config_set_string (&cb->host, child);
         else if (strcasecmp ("Port", child->key) == 0)
-            cf_util_get_service (child, &cb->service);
+            config_set_number (&cb->port, child);
         else if (strcasecmp ("Prefix", child->key) == 0)
-            cf_util_get_string (child, &cb->prefix);
+            config_set_string (&cb->prefix, child);
         else if (strcasecmp ("Postfix", child->key) == 0)
-            cf_util_get_string (child, &cb->postfix);
-        else if (strcasecmp ("StoreRates", child->key) == 0)
-            cf_util_get_boolean (child, &cb->store_rates);
-        else if (strcasecmp ("SeparateInstances", child->key) == 0)
-            cf_util_get_boolean (child, &cb->separate_instances);
-        else if (strcasecmp ("AlwaysAppendDS", child->key) == 0)
-            cf_util_get_boolean (child, &cb->always_append_ds);
-        else if (strcasecmp ("EscapeCharacter", child->key) == 0)
-            config_set_char (&cb->escape_char, child);
+            config_set_string (&cb->postfix, child);
+        else if (strcasecmp ("DotCharacter", child->key) == 0)
+            config_set_char (&cb->dotchar, child);
         else
         {
             ERROR ("write_graphite plugin: Invalid configuration "
@@ -652,17 +692,34 @@ static int wg_config_carbon (oconfig_item_t *ci)
         }
     }
 
-    ssnprintf (callback_name, sizeof (callback_name), "write_graphite/%s/%s",
-            cb->node != NULL ? cb->node : WG_DEFAULT_NODE,
-            cb->service != NULL ? cb->service : WG_DEFAULT_SERVICE);
+    if (cb->prefix == NULL) {
+        if ((cb->prefix = malloc((int)sizeof(char))) == NULL)
+        {
+            ERROR ("Unable to allocate memory for hostname prefix buffer");
+            return (-1);
+        }
+        cb->prefix[0] = '\0';
+    }
+
+    if (cb->postfix == NULL) {
+        if ((cb->postfix = malloc((int)sizeof(char))) == NULL)
+        {
+            ERROR ("Unable to allocate memory for hostname postfix buffer");
+            return (-1);
+        }
+        cb->postfix[0] = '\0';
+    }
+
+    DEBUG ("write_graphite: Registering write callback to carbon agent "
+            "%s:%d", cb->host, cb->port);
 
     memset (&user_data, 0, sizeof (user_data));
     user_data.data = cb;
-    user_data.free_func = wg_callback_free;
-    plugin_register_write (callback_name, wg_write, &user_data);
-
     user_data.free_func = NULL;
-    plugin_register_flush (callback_name, wg_flush, &user_data);
+    plugin_register_flush ("write_graphite", wg_flush, &user_data);
+
+    user_data.free_func = wg_callback_free;
+    plugin_register_write ("write_graphite", wg_write, &user_data);
 
     return (0);
 }
