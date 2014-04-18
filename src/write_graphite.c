@@ -438,7 +438,7 @@ static int wg_send_message (const char* key, const char* value,
     char message[1024];
 
     message_len = (size_t) ssnprintf (message, sizeof (message),
-            "%s %s %.0f\n",
+            "%s %s %ld\n",
             key,
             value,
             now);

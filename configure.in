@@ -1,6 +1,6 @@
 # Required initializer
 AC_PREREQ(2.59)
-AC_INIT(collectd-write-graphite, 1.0, ron@pedde.com)
+AC_INIT(collectd-write-graphite, 1.0.1, ron@pedde.com)
 AM_INIT_AUTOMAKE
 AC_CONFIG_SRCDIR([src/write_graphite.c])
 AC_CONFIG_HEADER([config.h])
